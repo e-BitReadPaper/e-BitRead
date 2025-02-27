@@ -19,6 +19,7 @@ import sys
 from torch.amp import autocast, GradScaler
 import cProfile
 import pstats
+from trace_process.bandwidth_lstm import BandwidthLSTM
 
 # 在导入语句后添加
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -27,8 +28,11 @@ print(f"Using device: {device}")
 # 环境参数
 M_IN_K = 1000
 BITRATES = [350, 600, 1000, 2000, 3000]
-S_LEN = 5
-A_DIM = 6
+S_LEN = 7
+# A_DIM = 6
+# 原来的动作空间: 5个码率 + 1个miss = 6
+# 新的动作空间: (5个码率 + 1个miss) * 3个edge server = 18
+A_DIM = 18  # 6 * 3
 throughput_mean = 2297514.2311790097
 throughput_std = 4369117.906444455
 
@@ -44,21 +48,21 @@ else:
 # PPO算法参数
 GAMMA = 0.99                # 折扣因子
 LAMBDA = 0.95              # GAE参数
-VALUE_COEF = 0.5           # 值函数损失系数
-ENTROPY_COEF = 0.01        # 熵正则化系数
-CLIP_EPSILON = 0.1         # PPO裁剪参数
+VALUE_COEF = 1.0           # 值函数损失系数
+ENTROPY_COEF = 0.02        # 熵正则化系数
+CLIP_EPSILON = 0.05         # PPO裁剪参数
 MAX_GRAD_NORM = 0.5        # 梯度裁剪阈值
 
 # 训练参数
-BATCH_SIZE = 8192          # 增大批量以提高效率
-MINI_BATCH_SIZE = 1024     # 相应增加小批量大小
-PPO_EPOCHS = 2            # 减少每批数据的更新次数
-LR = 2e-4                 # 略微提高学习率
+BATCH_SIZE = 4096          # 减小批量，提高更新频率
+MINI_BATCH_SIZE = 512      # 相应减小
+PPO_EPOCHS = 4             # 增加每批数据的更新次数
+LR = 1e-4                  # 降低学习率，提高稳定性
 NUM_WORKERS = 4            # worker数量
 
 # 早停参数
-EARLY_STOP_REWARD = 250    # 早停奖励阈值
-PATIENCE = 50              # 早停耐心值
+EARLY_STOP_REWARD = 400    # 提高目标奖励阈值
+PATIENCE = 100             # 增加耐心值
 
 
 
@@ -72,18 +76,22 @@ class Net(nn.Module):
     def __init__(self):
         super(Net, self).__init__()
         
-        # actor
+        # actor网络
         self.linear_1_a = nn.Linear(S_LEN, 200)
+        self.bn1_a = nn.BatchNorm1d(200)  # 添加BN层
         self.linear_2_a = nn.Linear(200, 100)
+        self.bn2_a = nn.BatchNorm1d(100)  # 添加BN层
         self.output_a = nn.Linear(100, A_DIM)
         
-        # critic
+        # critic网络
         self.linear_1_c = nn.Linear(S_LEN, 200)
+        self.bn1_c = nn.BatchNorm1d(200)  # 添加BN层
         self.linear_2_c = nn.Linear(200, 100)
+        self.bn2_c = nn.BatchNorm1d(100)  # 添加BN层
         self.output_c = nn.Linear(100, 1)
         
         set_init([self.linear_1_a, self.linear_2_a, self.output_a,
-                  self.linear_1_c, self.linear_2_c, self.output_c])
+                 self.linear_1_c, self.linear_2_c, self.output_c])
         self.distribution = torch.distributions.Categorical
         
         # 将模型移到GPU
@@ -93,12 +101,30 @@ class Net(nn.Module):
         # 确保输入在GPU上
         x = x.to(device)
         
-        linear_1_a = F.relu6(self.linear_1_a(x))
-        linear_2_a = F.relu6(self.linear_2_a(linear_1_a))
+        # actor前向传播
+        linear_1_a = self.linear_1_a(x)
+        if x.size(0) > 1:  # 只在batch size > 1时使用BN
+            linear_1_a = self.bn1_a(linear_1_a)
+        linear_1_a = F.relu6(linear_1_a)
+        
+        linear_2_a = self.linear_2_a(linear_1_a)
+        if x.size(0) > 1:  # 只在batch size > 1时使用BN
+            linear_2_a = self.bn2_a(linear_2_a)
+        linear_2_a = F.relu6(linear_2_a)
+        
         logits = self.output_a(linear_2_a)
         
-        linear_1_c = F.relu6(self.linear_1_c(x))
-        linear_2_c = F.relu6(self.linear_2_c(linear_1_c))
+        # critic前向传播
+        linear_1_c = self.linear_1_c(x)
+        if x.size(0) > 1:  # 只在batch size > 1时使用BN
+            linear_1_c = self.bn1_c(linear_1_c)
+        linear_1_c = F.relu6(linear_1_c)
+        
+        linear_2_c = self.linear_2_c(linear_1_c)
+        if x.size(0) > 1:  # 只在batch size > 1时使用BN
+            linear_2_c = self.bn2_c(linear_2_c)
+        linear_2_c = F.relu6(linear_2_c)
+        
         values = self.output_c(linear_2_c)
         
         return logits, values
@@ -307,8 +333,34 @@ class Worker:
         self.rewards = []
         
         # 初始化当前状态
-        self.current_state = self.init_state()
+        self.current_state = np.zeros(S_LEN)  # 使用numpy数组初始化状态
+        self.segmentNum = 0
         
+        # 添加奖励处理的参数
+        self.reward_scale = 100.0  # 奖励缩放因子
+        self.reward_clip_min = -10.0  # 奖励裁剪下限
+        self.reward_clip_max = 10.0   # 奖励裁剪上限
+        
+        # 初始化带宽LSTM模型
+        self.bandwidth_lstms = {
+            "edge1": BandwidthLSTM().to(device),
+            "edge2": BandwidthLSTM().to(device),
+            "edge3": BandwidthLSTM().to(device)
+        }
+        
+    def process_reward(self, raw_reward):
+        """处理奖励值"""
+        # 调整奖励缩放因子
+        REWARD_SCALE = 50.0  # 可以调整这个值
+        
+        # 归一化奖励
+        reward = raw_reward / REWARD_SCALE
+        
+        # 调整裁剪范围
+        reward = np.clip(reward, -5.0, 5.0)  # 缩小裁剪范围
+        
+        return reward
+    
     def get_video(self):
         """获取视频文件,使用概率选择"""
         while True:
@@ -330,32 +382,63 @@ class Worker:
         return np.loadtxt("../data/trace/busy/2/" + fileName).flatten().tolist()
 
     def getBandwidthFile(self):
-        """获取带宽文件"""
-        self.bwType = random.randint(1,3)
-        rtt = -1
+        """获取每个edge server的带宽文件"""
+        bandwidth_files = {}
+        rtt_values = {}
         
-        if self.bwType == 1:
-            dir = "../data/bandwidth/train/FCC"
-        elif self.bwType == 2:
-            dir = "../data/bandwidth/train/HSDPA"
-        else:
-            dir = "../data/bandwidth/train/mine"
-            
-        if self.bwType == 3:
-            ipDirList = os.listdir(dir)
-            ip = random.choice(ipDirList)
-            if ip not in self.rttDict:
-                print("no this ip:", ip, "in the bandwidth directory")
-                dir = "../data/bandwidth/train/HSDPA"
-            else:
-                rtt = self.rttDict[ip]
-            bandwidthFileList = os.listdir(dir + "/" + ip)
-            fileName = dir + "/" + ip + "/" + random.choice(bandwidthFileList)
-        else:
-            bandwidthFileList = os.listdir(dir)
-            fileName = dir + "/" + random.choice(bandwidthFileList)
-            
-        return fileName, rtt
+        bandwidth_paths = {
+            "edge1": "../data/bandwidth/train/edge1/FCC",
+            "edge2": "../data/bandwidth/train/edge2/HSDPA",
+            "edge3": "../data/bandwidth/train/edge3/mine"
+        }
+        
+        for server_name in ["edge1", "edge2", "edge3"]:
+            try:
+                bw_dir = os.path.abspath(bandwidth_paths[server_name])
+                
+                if not os.path.exists(bw_dir):
+                    bandwidth_files[server_name] = self.create_default_bandwidth_file()
+                    continue
+                
+                if server_name in ["edge1", "edge2"]:
+                    bw_files = glob.glob(os.path.join(bw_dir, "*.log"))
+                else:
+                    ip_dirs = os.listdir(bw_dir)
+                    if not ip_dirs:
+                        bandwidth_files[server_name] = self.create_default_bandwidth_file()
+                        continue
+                        
+                    selected_ip = random.choice(ip_dirs)
+                    ip_dir = os.path.join(bw_dir, selected_ip)
+                    bw_files = glob.glob(os.path.join(ip_dir, "*.log"))
+                
+                if not bw_files:
+                    bandwidth_files[server_name] = self.create_default_bandwidth_file()
+                else:
+                    bandwidth_files[server_name] = random.choice(bw_files)
+                
+                rtt_values[server_name] = self.rttDict.get(self.bwType, -1)
+                
+            except Exception as e:
+                bandwidth_files[server_name] = self.create_default_bandwidth_file()
+                rtt_values[server_name] = -1
+        
+        return bandwidth_files, rtt_values
+
+    def create_default_bandwidth_file(self):
+        """创建默认带宽数据文件"""
+        # 创建一个临时文件来存储默认带宽数据
+        temp_dir = "../data/bandwidth/temp"
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        file_path = os.path.join(temp_dir, "default_bandwidth.txt")
+        with open(file_path, 'w') as f:
+            # 生成100个时间点的带宽数据
+            for i in range(100):
+                # 时间戳 带宽(bps)
+                f.write(f"{i} 1000000\n")
+        
+        return file_path
 
     def step(self, action):
         """执行动作并获得奖励"""
@@ -369,6 +452,9 @@ class Worker:
         reqBitrate, lastBitrate, buffer, hThroughput, mThroughput, \
         reward, reqBI, done, segmentNum = self.client.run(action, busy, hitFlag)
         
+        # 处理奖励
+        processed_reward = self.process_reward(reward)
+        
         # 更新状态
         self.current_state = {
             'reqBitrate': reqBitrate / BITRATES[-1],
@@ -379,7 +465,7 @@ class Worker:
         }
         
         self.segmentNum = segmentNum
-        return reward  # 直接返回 client.py 中计算的 reward
+        return processed_reward  # 直接返回 client.py 中计算的 reward
 
     def init_state(self):
         """初始化状态"""
@@ -392,36 +478,59 @@ class Worker:
         }
 
     def get_state(self):
-        """获取当前状态向量"""
-        state = [
-            self.current_state['reqBitrate'],
-            self.current_state['lastBitrate'],
-            self.current_state['bufferSize'],
-            self.current_state['hThroughput'],
-            self.current_state['mThroughput']
-        ]
-        # 确保返回 float32 类型的张量
-        return torch.FloatTensor(state).float()
+        """获取当前状态"""
+        if self.client.current_server is None:
+            server_id = 0  # 默认使用edge1
+            last_server_id = -1
+        else:
+            try:
+                server_id = int(self.client.current_server.split('edge')[1]) - 1
+                last_server_id = -1 if self.client.last_server is None else \
+                                int(self.client.last_server.split('edge')[1]) - 1
+            except (AttributeError, IndexError, ValueError):
+                print(f"Warning: Invalid server name format. Current: {self.client.current_server}, Last: {self.client.last_server}")
+                server_id = 0
+                last_server_id = -1
+        
+        state = {
+            'reqBitrate': self.current_state[0],
+            'lastBitrate': self.current_state[1],
+            'bufferSize': self.current_state[2],
+            'hThroughput': self.current_state[3],
+            'mThroughput': self.current_state[4],
+            'server_id': server_id / 2,  # 归一化
+            'last_server_id': (last_server_id + 1) / 3  # 归一化
+        }
+        
+        return np.array([
+            state['reqBitrate'],
+            state['lastBitrate'],
+            state['bufferSize'],
+            state['hThroughput'],
+            state['mThroughput'],
+            state['server_id'],
+            state['last_server_id']
+        ])
 
     def select_action(self, state):
-        """选择动作"""
+        """选择动作并返回相关信息"""
         with torch.no_grad():
-            if not isinstance(state, torch.Tensor):
-                state = torch.FloatTensor(state)
-            state = state.float()
+            state = torch.FloatTensor(state).unsqueeze(0).to(device)
+            logits, value = self.policy(state)
+            probs = F.softmax(logits, dim=-1)
+            dist = self.policy.distribution(probs)
             
-            if state.device != device:
-                state = state.to(device)
-                
-            if state.dim() == 1:
-                state = state.unsqueeze(0)
-                
-            logits, _ = self.policy(state)
-            action_probs = F.softmax(logits, dim=-1)
-            dist = torch.distributions.Categorical(action_probs)
+            # 选择动作
             action = dist.sample()
             
-        return action.item()
+            # 计算动作的对数概率
+            action_log_prob = dist.log_prob(action)
+            
+            return (
+                action.item(),  # 转换为Python数值
+                action_log_prob.item(),  # 转换为Python数值
+                value.item()  # 转换为Python数值
+            )
 
     def update_policy(self, states, actions, rewards):
         """更新策略网络"""
@@ -514,7 +623,7 @@ class Worker:
             
             print(f"\n性能统计:")
             print(f"总用时: {duration:.2f}秒")
-            print(f"样本处理速度: {min(100, BATCH_SIZE)/duration:.1f} samples/s")
+            print(f"样本理速度: {min(100, BATCH_SIZE)/duration:.1f} samples/s")
             print(f"GPU显存使用: {torch.cuda.memory_allocated()/1024**2:.1f}MB")
             print(f"GPU利用率: {torch.cuda.utilization()}%\n")
             
@@ -523,12 +632,19 @@ class Worker:
             
         print("=== 性能分析完成 ===\n")
 
+    def process_bandwidth(self, hThroughput, server_name):
+        """使用LSTM处理带宽数据"""
+        processed_throughput = self.bandwidth_lstms[server_name].process_throughput(hThroughput)
+        return (processed_throughput - throughput_mean) / throughput_std
+
     def run(self):
         """训练主循环"""
         print("开始训练...")
         episode = 0
         best_reward = float('-inf')
         patience_counter = 0
+        running_reward = 0
+        last_server_id = -1  # 初始化last_server_id
         
         while episode < MAX_EP:
             # 初始化环境
@@ -537,57 +653,133 @@ class Worker:
             self.busyList = self.get_busyTrace()
             self.segmentNum = 0
             
-            # 初始化客户端
+            # 初始化client
             reqBI = self.client.init(self.videoName, self.bandwidth_file, self.rtt, self.bwType)
-            self.current_state = self.init_state()
             
-            # 收集一个批次的数据
+            # 初始化状态
+            self.current_state = [
+                reqBI / BITRATES[-1],  # 归一化的请求码率
+                -1 / BITRATES[-1],     # 归一化的上一个码率
+                0,                     # 归一化的缓冲区大小
+                0,                     # 归一化的历史吞吐量
+                0,                     # 归一化的预测吞吐量
+                0,                     # 归一化的当前server_id
+                -1/3                   # 归一化的上一个server_id
+            ]
+            
+            # 初始化轨迹存储
             states = []
             actions = []
             rewards = []
+            log_probs = []
+            values = []
             episode_reward = 0
             
-            # 性能分析（每100个episode进行一次）
-            if episode % 100 == 0:
-                self.profile_performance()
-            
             # 收集轨迹
-            for step in range(BATCH_SIZE):
+            while True:
                 # 获取当前状态
                 state = self.get_state()
                 
                 # 选择动作
-                action = self.select_action(state)
+                with torch.no_grad():
+                    state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+                    logits, value = self.policy(state_tensor)
+                    probs = F.softmax(logits, dim=-1)
+                    dist = self.policy.distribution(probs)
+                    action = dist.sample()
+                    action_log_prob = dist.log_prob(action)
+                
+                # 转换为Python数值
+                action_value = action.item()
+                log_prob_value = action_log_prob.item()
+                value_value = value.squeeze().item()
+                
+                # 处理动作
+                server_idx = action_value // 6  # 确定选择哪个edge server
+                bitrate_action = action_value % 6  # 确定码率或miss
+                
+                # 获取对应的server名称
+                server_name = f"edge{server_idx + 1}"
+                
+                # 在执行动作前保存当前server_id
+                last_server_id = server_idx
                 
                 # 执行动作
-                reward = self.step(action)
+                busy = self.busyList[self.segmentNum % len(self.busyList)]
+                hitFlag = True if bitrate_action != 5 else False
+                
+                reqBitrate, lastBitrate, buffer, hThroughput, mThroughput, reward, reqBI, done, segNum = \
+                    self.client.run(bitrate_action, busy, hitFlag, server_name)
+                
+                # 添加详细的训练状态打印
+                print(f"Episode {episode:5d} | "
+                      f"Step {len(states):4d} | "
+                      f"Seg {segNum:4d} | "
+                      f"ReqBR: {reqBitrate:5d} | "
+                      f"LastBR: {lastBitrate:5d} | "
+                      f"Buffer: {buffer/1000:6.2f}s | "
+                      f"HTput: {hThroughput/1000000:6.2f}Mbps | "
+                      f"MTput: {mThroughput/1000000:6.2f}Mbps | "
+                      f"Reward: {reward:6.2f} | "
+                      f"ReqBI: {reqBI} | "
+                      f"Done: {done} | "
+                      f"Server: {server_name}")
+                
+                # 使用LSTM处理带宽
+                processed_throughput = self.process_bandwidth(hThroughput, server_name)
+                
+                # 更新状态
+                self.current_state = [
+                    reqBitrate / BITRATES[-1],
+                    lastBitrate / BITRATES[-1],
+                    (buffer/1000 - 30) / 10,
+                    processed_throughput,  # 使用LSTM处理后的带宽
+                    (mThroughput - throughput_mean) / throughput_std,
+                    server_idx / 2,  # 当前服务器ID
+                    (last_server_id + 1) / 3  # 上一个服务器ID
+                ]
                 
                 # 存储轨迹
                 states.append(state)
-                actions.append(action)
+                actions.append(action_value)
                 rewards.append(reward)
+                log_probs.append(log_prob_value)
+                values.append(value_value)
                 
+                # 累计episode奖励
                 episode_reward += reward
                 
-                # 如果视频播放完毕，结束本轮
+                # 更新状态
+                self.segmentNum = segNum
+                self.current_state = [
+                    reqBitrate / BITRATES[-1],
+                    lastBitrate / BITRATES[-1],
+                    (buffer/1000 - 30) / 10,
+                    processed_throughput,  # 使用LSTM处理后的带宽
+                    (mThroughput - throughput_mean) / throughput_std,
+                    server_idx / 2,
+                    (last_server_id + 1) / 3
+                ]
+                
+                # 检查是否结束episode
                 if self.segmentNum >= self.client.segmentCount:
+                    last_server_id = -1
+                    break
+                
+                # 检查是否达到批量大小
+                if len(states) >= BATCH_SIZE:
                     break
             
-            # 更新策略
-            if states:  # 确保有数据再更新
-                self.update_policy(states, actions, rewards)
+            # 更新运行时平均奖励
+            running_reward = 0.05 * episode_reward + (1 - 0.05) * running_reward
             
-            # 记录奖励
-            self.rewards.append(episode_reward)
-            
-            # 打印训练信息
+            # 记录和打印训练信息
             if episode % 10 == 0:
-                avg_reward = np.mean(self.rewards[-10:])
-                print(f"Episode {episode}, Average Reward: {avg_reward:.2f}")
+                print(f"Episode {episode}, Running Reward: {running_reward:.2f}")
                 
                 # 保存最佳模型
-                if avg_reward > best_reward:
-                    best_reward = avg_reward
+                if running_reward > best_reward:
+                    best_reward = running_reward
                     if not PRINTFLAG:
                         torch.save(self.policy.state_dict(), 
                                  f"{self.model_dir}/model/best_model.pth")
@@ -601,7 +793,7 @@ class Worker:
                          f"{self.model_dir}/model/model_{episode}.pth")
             
             # 早停检查
-            if patience_counter >= PATIENCE and episode_reward > EARLY_STOP_REWARD:
+            if patience_counter >= PATIENCE and running_reward > EARLY_STOP_REWARD:
                 print(f"Early stopping at episode {episode}")
                 break
             

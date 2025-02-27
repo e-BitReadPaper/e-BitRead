@@ -39,11 +39,13 @@ def cdf(folder):
             total_b = 0.0
             for traceFName in os.listdir(dir + "/" + pol):
                 file = open(dir + "/" + pol + "/" +traceFName)
-                lines = file.readlines()[1:]
+                lines = file.readlines()[2:]
                 segCount += len(lines)
                 last_br = 0
                 for line in lines:
-                    # segNum	size	Hit	buffer	bIndex	actualBI	lBIndex	bitrate	throughput	downloadT	rebufferT	qoe	reward	time
+                    # 旧的序列:segNum	size	Hit	buffer	bIndex	actualBI	lBIndex	bitrate	throughput	downloadT	rebufferT	qoe	reward	time
+                    # 新的序列:No	cSize	Hit	buffer	bI	aBI	lastBI	bitrate	throughput	hThroughput	mThroughput	downloadT	rebufferT	qoe	reward	time	busy
+
                     elements = line.split("\t")
                     # hit -------------------------------------
                     hit = int(elements[2])
@@ -53,14 +55,14 @@ def cdf(folder):
                     bI = int(elements[5])
                     if bI != -1:
                         bitrateL[polI][bI] += 1
-                    # bitrate variation -----------------------
-                    bitrate = int(elements[7])*1.0 / 1024/1024 # Mbps
+                    # bitrate variation -----------------------  
+                    bitrate = int(elements[7])*1.0 / 1024 # Mbps  
                     total_b += bitrate
                     total_osc += abs(last_br - bitrate)
                     bVarL[polI].append(abs(last_br - bitrate))
                     last_br = bitrate
                     # rebufferT -------------------------------
-                    reb = float(elements[-4])
+                    reb = max(0, float(elements[12]))
                     total_reb += reb
                     if reb > 20000:
                         print(traceFName,line)
@@ -155,7 +157,7 @@ def takeSecond(elem):
 
 
 def getSizeDict(dir):
-    file = open("../makeVideoSet/videoSizePerVision.txt")
+    file = open("../file/videoSizePerVision.txt")
     lines = file.readlines()
     virsionSizeDict = {} # videoName_bIndex size
     for line in lines:
@@ -220,7 +222,7 @@ def main():
     dir = "./res/2019-03-19_19-36-28/trace_1"
     bw_types = ['mine', 'FCC', 'HSDPA']
 
-    dir = "../../data/RL_model/2019-06-28_10-18-56/test_trace_2/"
+    dir = "../data/RL_model/2025-01-12_17-10-53/test_trace_Pensieve_0/"
     cdf(dir)
 
     # drawClient()
